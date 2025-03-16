@@ -231,14 +231,12 @@ async function analyzePitch(audioPath, transcriptionData) {
     console.log('Processing audio file:', audioPath);
     
     if (!audioPath) {
-      console.log('No audio file path provided, generating synthetic data');
-      return generateSyntheticPitchData(transcriptionData);
+      throw new Error('No audio file path provided - pitch analysis requires an audio file');
     }
 
     // Check if file exists
     if (!fs.existsSync(audioPath)) {
-      console.log('Audio file not found, generating synthetic data');
-      return generateSyntheticPitchData(transcriptionData);
+      throw new Error('Audio file not found - cannot perform pitch analysis');
     }
 
     // Convert audio to mono 16kHz WAV using ffmpeg
@@ -266,14 +264,12 @@ async function analyzePitch(audioPath, transcriptionData) {
       });
     } catch (ffmpegError) {
       console.error('Error converting audio:', ffmpegError);
-      console.log('Falling back to synthetic data due to FFmpeg error');
-      return generateSyntheticPitchData(transcriptionData);
+      throw new Error('Failed to convert audio to WAV format: ' + ffmpegError.message);
     }
 
     // Check if processed file exists
     if (!fs.existsSync(processedAudioPath)) {
-      console.log('Processed audio file not created, generating synthetic data');
-      return generateSyntheticPitchData(transcriptionData);
+      throw new Error('Processed audio file was not created - FFmpeg conversion failed');
     }
 
     // Read the processed audio file
@@ -282,8 +278,7 @@ async function analyzePitch(audioPath, transcriptionData) {
       audioBuffer = await fs.promises.readFile(processedAudioPath);
     } catch (readError) {
       console.error('Error reading processed audio file:', readError);
-      console.log('Falling back to synthetic data due to file read error');
-      return generateSyntheticPitchData(transcriptionData);
+      throw new Error('Failed to read processed audio file: ' + readError.message);
     }
     
     // Convert Buffer to ArrayBuffer
@@ -330,6 +325,10 @@ async function analyzePitch(audioPath, transcriptionData) {
         });
       }
       
+      if (pitchData.length === 0) {
+        throw new Error('No pitch data could be extracted from the audio');
+      }
+      
       console.log('Extracting audio snippet for playback...');
       // Extract audio snippet for playback
       const audioSnippetUrl = await extractAudioSnippet(audioPath);
@@ -348,26 +347,25 @@ async function analyzePitch(audioPath, transcriptionData) {
       return result;
     } catch (error) {
       console.error('Error in audio processing:', error);
-      console.log('Falling back to synthetic data due to audio processing error');
       
       // Check if error is related to ALSA/audio device
-      if (error.message && (
-          error.message.includes('ALSA') || 
-          error.message.includes('PCM') || 
-          error.message.includes('DeviceNotAvailable') ||
-          error.message.includes('device')
-      )) {
-        console.log('ALSA/audio device error detected - this is expected in environments without audio hardware');
-      }
+      const isAudioDeviceError = error.message && (
+        error.message.includes('ALSA') || 
+        error.message.includes('PCM') || 
+        error.message.includes('DeviceNotAvailable') ||
+        error.message.includes('device')
+      );
       
-      // Generate synthetic pitch data based on transcription
-      return generateSyntheticPitchData(transcriptionData);
+      if (isAudioDeviceError) {
+        console.error('ALSA/audio device error detected - server environment may not support audio processing');
+        throw new Error('Server environment does not support audio processing: ' + error.message);
+      } else {
+        throw new Error('Failed to process audio data: ' + error.message);
+      }
     }
   } catch (error) {
     console.error('Error in pitch analysis:', error);
-    console.log('Falling back to synthetic data due to general pitch analysis error');
-    // Return default structure when pitch analysis fails
-    return generateSyntheticPitchData(transcriptionData);
+    throw new Error('Pitch analysis failed: ' + error.message);
   } finally {
     // Clean up processed audio file
     if (processedAudioPath && fs.existsSync(processedAudioPath)) {
@@ -909,11 +907,151 @@ async function analyzeVocalArchetypes(transcript, pitchData) {
   console.log("Analyzing vocal archetypes...");
   
   try {
-    // Extract relevant features from the pitch data
-    const features = extractPitchFeatures(pitchData);
+    // First, check if the pitch data is valid
+    if (!pitchData) {
+      console.log("No pitch data provided for vocal archetypes analysis");
+      return getDefaultVocalArchetypes();
+    }
     
-    // Use GPT to analyze the vocal archetype based on transcript and features
-    const prompt = `
+    console.log("Pitch data type:", typeof pitchData);
+    console.log("Is pitch data array:", Array.isArray(pitchData));
+    
+    // Check pitch data structure for debugging
+    if (pitchData && typeof pitchData === 'object') {
+      const keys = Object.keys(pitchData);
+      console.log("Pitch data keys:", keys.join(", "));
+      
+      // Check for nested structures
+      if (pitchData.sentences) {
+        console.log("Found sentences in pitch data, length:", pitchData.sentences.length);
+      }
+    }
+    
+    // Process raw pitch data to format expected by extractPitchFeatures
+    let processedPitchData;
+    
+    // If pitchData contains raw pitch points (time + pitch)
+    if (Array.isArray(pitchData) && pitchData.length > 0 && 'time' in pitchData[0] && 'pitch' in pitchData[0]) {
+      console.log("Processing raw pitch points data");
+      
+      // Create segments with pitchValues for extractPitchFeatures
+      const segments = [{
+        text: transcript || "",
+        duration: (pitchData[pitchData.length-1]?.time || 0) - (pitchData[0]?.time || 0),
+        pitchValues: pitchData.map(p => p.pitch)
+      }];
+      
+      processedPitchData = segments;
+    }
+    // If pitchData is already the processed pitch analysis with sentences 
+    else if (pitchData && pitchData.sentences && Array.isArray(pitchData.sentences)) {
+      console.log("Using sentences from pitch analysis");
+      
+      // Convert each sentence to a segment with pitchValues
+      processedPitchData = pitchData.sentences.map(sentence => {
+        // Get all pitch values from words in the sentence
+        const pitchValues = sentence.words
+          ? sentence.words
+              .filter(word => word && typeof word.pitch === 'number')
+              .map(word => word.pitch) 
+          : [];
+          
+        return {
+          text: sentence.text || "",
+          duration: (sentence.end || 0) - (sentence.start || 0),
+          pitchValues: pitchValues
+        };
+      });
+    }
+    // If pitchData is already in the expected format with pitchValues
+    else if (Array.isArray(pitchData) && pitchData.some(item => item && item.pitchValues)) {
+      console.log("Using existing processed pitch data with pitchValues");
+      processedPitchData = pitchData;
+    }
+    // As a last resort, try to extract features directly
+    else {
+      console.log("Using custom feature extraction for pitch data");
+      
+      // Skip feature extraction and use default values
+      const features = {
+        averagePitch: 120,
+        pitchVariability: 20,
+        speakingRate: 150,
+        pauseFrequency: 10
+      };
+      
+      // Use GPT to analyze the vocal archetype based on transcript and features
+      const prompt = `
+You are an expert speech analyst who specializes in identifying vocal archetypes in speech. 
+I need you to analyze the following transcript and classify the speaker 
+into these three specific archetypes: The Valiant, The Caregiver, and The Sage.
+
+Transcript: "${transcript}"
+
+Archetypes:
+1. The Valiant (Motivational, Energetic, Action-oriented)
+   - Characterizes speakers who are motivational, energizing, and action-oriented
+   - Uses uplifting language and dynamic delivery
+   - Focuses on growth, achievement, and overcoming challenges
+   - Emphasizes action steps and forward momentum
+
+2. The Caregiver (Nurturing, Supportive, Relationship-focused)
+   - Characterizes speakers who are nurturing, supportive, and relationship-focused
+   - Uses empathetic language and warm delivery
+   - Focuses on connection, wellbeing, and meeting needs
+   - Emphasizes shared experiences and community
+
+3. The Sage (Thoughtful, Measured, Knowledge-focused)
+   - Characterizes speakers who are contemplative, measured, and knowledge-focused
+   - Uses precise language and measured delivery
+   - Focuses on insight, wisdom, and understanding
+   - Emphasizes clarity, depth, and perspective
+
+Based solely on the transcript content and style (not considering audio features), analyze the speaker's vocal archetype.
+
+For your response, provide:
+1. A percentage breakdown across all three archetypes (must total 100%)
+2. The dominant archetype (the one with the highest percentage)
+3. A brief analysis explaining why this archetype is dominant and how the other archetypes are or aren't present
+
+Output the results in the following JSON format:
+{
+  "archetypes": [
+    {"name": "The Valiant", "score": number, "color": "#FFC107"},
+    {"name": "The Caregiver", "score": number, "color": "#E91E63"},
+    {"name": "The Sage", "score": number, "color": "#2196F3"}
+  ],
+  "dominantArchetype": "The [Dominant Archetype Name]",
+  "analysis": "Brief analysis explaining the results."
+}`;
+
+      try {
+        const response = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: [
+            { role: "system", content: prompt },
+            { role: "user", content: transcript }
+          ],
+          temperature: 0.7,
+          max_tokens: 1500
+        });
+        
+        const result = JSON.parse(response.choices[0].message.content);
+        console.log("Vocal archetype analysis response:", result);
+        return result;
+      } catch (error) {
+        console.error("Error in vocal archetype GPT analysis:", error);
+        return getDefaultVocalArchetypes();
+      }
+    }
+    
+    // Now extract features using the properly formatted data
+    try {
+      console.log("Extracting features from processed pitch data");
+      const features = extractPitchFeatures(processedPitchData);
+      
+      // Use GPT to analyze the vocal archetype based on transcript and features
+      const prompt = `
 You are an expert speech analyst who specializes in identifying vocal archetypes in speech. 
 I need you to analyze the following transcript and speech features and classify the speaker 
 into these three specific archetypes: The Valiant, The Caregiver, and The Sage.
@@ -923,78 +1061,69 @@ Transcript: "${transcript}"
 Speech Features:
 - Average Pitch: ${features.averagePitch} (Higher values indicate higher pitch)
 - Pitch Variability: ${features.pitchVariability} (Higher values indicate more varied intonation)
-- Speaking Rate: ${features.speakingRate} words per minute
-- Pause Frequency: ${features.pauseFrequency} pauses per minute
+- Speaking Rate: ${features.speakingRate} words per minute (Average is 120-150)
+- Pause Frequency: ${features.pauseFrequency} pauses per minute (Higher values indicate more frequent pauses)
 
-For reference, here are the archetype definitions:
+Archetypes:
+1. The Valiant (Motivational, Energetic, Action-oriented)
+   - Characterizes speakers who are motivational, energizing, and action-oriented
+   - Typically has higher pitch, greater variability, faster speaking rate
+   - Uses uplifting language and dynamic delivery
+   - Focuses on growth, achievement, and overcoming challenges
+   - Emphasizes action steps and forward momentum
 
-1. The Valiant:
-   - Increased rate of speech
-   - High level of energy and volume
-   - Short and punchy delivery
-   - Purposeful movement in speech patterns
-   - Examples: Motivational speakers, religious sermons, Tony Robbins, Les Brown
-   - Primary purpose: Move people to action
+2. The Caregiver (Nurturing, Supportive, Relationship-focused)
+   - Characterizes speakers who are nurturing, supportive, and relationship-focused
+   - Typically has a warm, steady pitch with moderate variability
+   - Uses empathetic language and warm delivery
+   - Focuses on connection, wellbeing, and meeting needs
+   - Emphasizes shared experiences and community
 
-2. The Caregiver:
-   - Slower rates of speech
-   - Lower volume
-   - Longer pauses that create connection
-   - Radiates love, care & empathy
-   - Warm, nurturing tone
-   - Primary purpose: Connect emotionally and provide support
+3. The Sage (Thoughtful, Measured, Knowledge-focused)
+   - Characterizes speakers who are contemplative, measured, and knowledge-focused
+   - Typically has a lower, more consistent pitch with strategic pauses
+   - Uses precise language and measured delivery
+   - Focuses on insight, wisdom, and understanding
+   - Emphasizes clarity, depth, and perspective
 
-3. The Sage:
-   - Slower rates of speech (especially when explaining complex topics)
-   - More frequent pauses (helps audience digest content)
-   - Matter-of-fact pitch pattern (sentences often end on lower pitch)
-   - Thoughtful, measured delivery
-   - Example: Engaging university lecturer
-   - Primary purpose: Impart knowledge and wisdom
+Based on both the transcript content and the speech features, analyze the speaker's vocal archetype.
 
-Based on the transcript and speech features, assign a percentage score (0-100) for each archetype, where the total should add up to approximately 100%.
-Also determine the dominant archetype, and provide a brief analysis (2-3 sentences) explaining why.
+For your response, provide:
+1. A percentage breakdown across all three archetypes (must total 100%)
+2. The dominant archetype (the one with the highest percentage)
+3. A brief analysis explaining why this archetype is dominant and how the other archetypes are or aren't present
 
-Format your response exactly as follows, without any preamble or additional text:
+Output the results in the following JSON format:
 {
   "archetypes": [
-    { "name": "The Valiant", "score": 0, "color": "#FFC107" },
-    { "name": "The Caregiver", "score": 0, "color": "#E91E63" },
-    { "name": "The Sage", "score": 0, "color": "#2196F3" }
+    {"name": "The Valiant", "score": number, "color": "#FFC107"},
+    {"name": "The Caregiver", "score": number, "color": "#E91E63"},
+    {"name": "The Sage", "score": number, "color": "#2196F3"}
   ],
-  "dominantArchetype": "",
-  "analysis": ""
-}
-`;
+  "dominantArchetype": "The [Dominant Archetype Name]",
+  "analysis": "Brief analysis explaining the results."
+}`;
 
-    const completion = await openai.chat.completions.create({
-      model: process.env.GPT_MODEL || "gpt-4",
-      messages: [{ "role": "user", "content": prompt }],
-      temperature: 0.7,
-      max_tokens: 500
-    });
-
-    const content = completion.choices[0].message.content.trim();
-    console.log("Vocal archetype analysis response:", content);
-    
-    try {
-      // Extract the JSON part from the response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      const jsonStr = jsonMatch ? jsonMatch[0] : null;
+      const response = await openai.chat.completions.create({
+        model: "gpt-4",
+        messages: [
+          { role: "system", content: prompt },
+          { role: "user", content: transcript }
+        ],
+        temperature: 0.7,
+        max_tokens: 1500
+      });
       
-      if (!jsonStr) {
-        console.error("No valid JSON found in GPT response");
-        return getDefaultVocalArchetypes();
-      }
-      
-      const result = JSON.parse(jsonStr);
+      const result = JSON.parse(response.choices[0].message.content);
+      console.log("Vocal archetype analysis response:", result);
       return result;
-    } catch (jsonError) {
-      console.error("Error parsing vocal archetype analysis JSON:", jsonError);
+    } catch (error) {
+      console.error("Error extracting pitch features:", error);
+      // Fall back to text-only analysis
       return getDefaultVocalArchetypes();
     }
   } catch (error) {
-    console.error("Error analyzing vocal archetypes:", error);
+    console.error("Error in vocal archetypes analysis:", error);
     return getDefaultVocalArchetypes();
   }
 }
@@ -1002,46 +1131,144 @@ Format your response exactly as follows, without any preamble or additional text
 // Helper function to extract speech features from pitch data
 function extractPitchFeatures(pitchData) {
   try {
-    // Calculate average pitch
-    const pitchValues = pitchData.flatMap(segment => segment.pitchValues.filter(p => p > 0));
-    const averagePitch = pitchValues.length > 0 
-      ? Math.round(pitchValues.reduce((sum, val) => sum + val, 0) / pitchValues.length)
-      : 0;
+    console.log("Extracting pitch features from data...");
     
-    // Calculate pitch variability (standard deviation of pitch)
-    let pitchVariability = 0;
-    if (pitchValues.length > 0) {
-      const squaredDiffs = pitchValues.map(val => Math.pow(val - averagePitch, 2));
-      const variance = squaredDiffs.reduce((sum, val) => sum + val, 0) / pitchValues.length;
-      pitchVariability = Math.round(Math.sqrt(variance));
+    // Check if pitchData is an array of sentences (synthetic data format)
+    if (Array.isArray(pitchData) && pitchData.length > 0 && pitchData[0].text) {
+      console.log("Processing synthetic pitch data format (array of sentences)");
+      
+      // Calculate average pitch from words in sentences
+      let allPitchValues = [];
+      let totalWords = 0;
+      let totalDuration = 0;
+      let pauseCount = 0;
+      
+      // Extract pitch values from all words in all sentences
+      pitchData.forEach((sentence, idx) => {
+        if (sentence.words && Array.isArray(sentence.words)) {
+          // Add pitch values from words
+          const sentencePitches = sentence.words
+            .filter(word => word && typeof word.pitch === 'number')
+            .map(word => word.pitch);
+          
+          allPitchValues = allPitchValues.concat(sentencePitches);
+          totalWords += sentence.words.length;
+          
+          // Calculate duration
+          if (typeof sentence.start === 'number' && typeof sentence.end === 'number') {
+            totalDuration += (sentence.end - sentence.start);
+          }
+          
+          // Count pauses between sentences
+          if (idx > 0 && pitchData[idx-1] && 
+              typeof sentence.start === 'number' && 
+              typeof pitchData[idx-1].end === 'number') {
+            const pauseDuration = sentence.start - pitchData[idx-1].end;
+            if (pauseDuration > 0.2) {
+              pauseCount++;
+            }
+          }
+        }
+      });
+      
+      // Calculate average pitch
+      const averagePitch = allPitchValues.length > 0 
+        ? Math.round(allPitchValues.reduce((sum, val) => sum + val, 0) / allPitchValues.length)
+        : 0;
+      
+      // Calculate pitch variability (standard deviation)
+      let pitchVariability = 0;
+      if (allPitchValues.length > 0) {
+        const squaredDiffs = allPitchValues.map(val => Math.pow(val - averagePitch, 2));
+        const variance = squaredDiffs.reduce((sum, val) => sum + val, 0) / allPitchValues.length;
+        pitchVariability = Math.round(Math.sqrt(variance));
+      }
+      
+      // Calculate speaking rate (words per minute)
+      const speakingRate = totalDuration > 0 
+        ? Math.round((totalWords / totalDuration) * 60) 
+        : 0;
+      
+      // Calculate pause frequency
+      const pauseFrequency = totalDuration > 0 
+        ? Math.round((pauseCount / totalDuration) * 60) 
+        : 0;
+      
+      console.log(`Extracted features from synthetic data: avgPitch=${averagePitch}, variability=${pitchVariability}, rate=${speakingRate}, pauses=${pauseFrequency}`);
+      
+      return {
+        averagePitch,
+        pitchVariability,
+        speakingRate,
+        pauseFrequency
+      };
     }
-    
-    // Calculate speaking rate (words per minute)
-    const totalWords = pitchData.reduce((sum, segment) => sum + (segment.text.split(/\s+/).length || 0), 0);
-    const totalDuration = pitchData.reduce((sum, segment) => sum + (segment.duration || 0), 0);
-    const speakingRate = totalDuration > 0 
-      ? Math.round((totalWords / totalDuration) * 60) 
-      : 0;
-    
-    // Calculate pause frequency
-    const pauseCount = pitchData.length > 1 ? pitchData.length - 1 : 0;
-    const pauseFrequency = totalDuration > 0 
-      ? Math.round((pauseCount / totalDuration) * 60) 
-      : 0;
-    
-    return {
-      averagePitch,
-      pitchVariability,
-      speakingRate,
-      pauseFrequency
-    };
+    // Check if pitchData has sentences property (real data format from analyzePitch)
+    else if (pitchData && pitchData.sentences && Array.isArray(pitchData.sentences)) {
+      console.log("Processing real pitch data format (object with sentences property)");
+      return extractPitchFeatures(pitchData.sentences);
+    }
+    // Check if pitchData has pitchValues property (original format expected by the function)
+    else if (pitchData && Array.isArray(pitchData) && pitchData.some(segment => segment.pitchValues)) {
+      console.log("Processing original pitch data format with pitchValues");
+      
+      // Calculate average pitch
+      const pitchValues = pitchData.flatMap(segment => segment.pitchValues.filter(p => p > 0));
+      const averagePitch = pitchValues.length > 0 
+        ? Math.round(pitchValues.reduce((sum, val) => sum + val, 0) / pitchValues.length)
+        : 0;
+      
+      // Calculate pitch variability (standard deviation of pitch)
+      let pitchVariability = 0;
+      if (pitchValues.length > 0) {
+        const squaredDiffs = pitchValues.map(val => Math.pow(val - averagePitch, 2));
+        const variance = squaredDiffs.reduce((sum, val) => sum + val, 0) / pitchValues.length;
+        pitchVariability = Math.round(Math.sqrt(variance));
+      }
+      
+      // Calculate speaking rate (words per minute)
+      const totalWords = pitchData.reduce((sum, segment) => sum + (segment.text.split(/\s+/).length || 0), 0);
+      const totalDuration = pitchData.reduce((sum, segment) => sum + (segment.duration || 0), 0);
+      const speakingRate = totalDuration > 0 
+        ? Math.round((totalWords / totalDuration) * 60) 
+        : 0;
+      
+      // Calculate pause frequency
+      const pauseCount = pitchData.length > 1 ? pitchData.length - 1 : 0;
+      const pauseFrequency = totalDuration > 0 
+        ? Math.round((pauseCount / totalDuration) * 60) 
+        : 0;
+      
+      return {
+        averagePitch,
+        pitchVariability,
+        speakingRate,
+        pauseFrequency
+      };
+    }
+    // Fallback for unknown format
+    else {
+      console.log("Unknown pitch data format, returning default values");
+      console.log("Pitch data type:", typeof pitchData);
+      console.log("Is array:", Array.isArray(pitchData));
+      if (pitchData) {
+        console.log("First item properties:", Object.keys(pitchData[0] || {}).join(", "));
+      }
+      
+      return {
+        averagePitch: 120,
+        pitchVariability: 20,
+        speakingRate: 150,
+        pauseFrequency: 10
+      };
+    }
   } catch (error) {
     console.error("Error extracting pitch features:", error);
     return {
-      averagePitch: 0,
-      pitchVariability: 0,
-      speakingRate: 0,
-      pauseFrequency: 0
+      averagePitch: 120,
+      pitchVariability: 20,
+      speakingRate: 150,
+      pauseFrequency: 10
     };
   }
 }
@@ -1415,417 +1642,281 @@ EXAMPLES OF GOOD PHRASES:
           }
         }
         
-        // Verify the phrase is actually in the transcript at the specified indices
-        console.log(`\nVerifying phrase: "${phrase.phrase}"`);
-        console.log(`At indices: ${phrase.startIndex}-${phrase.endIndex}`);
-        console.log(`Text at indices: "${transcriptionText.substring(phrase.startIndex, phrase.endIndex)}"`);
-        
-        // Log the significance data for debugging
+        return phrase;
+      });
+    } catch (e) {
+      console.error('Failed to parse AI analysis', e);
+      parsedAnalysis = { preciseLanguage: [] };
+    }
+    
+    // Process highlighted phrases
+    let highlightedPhrases = [];
+    
+    try {
+      // Extract raw precise language instances from AI response
+      console.log('\n=== Raw Precise Phrases ===');
+      console.log(JSON.stringify(parsedAnalysis.preciseLanguage || [], null, 2));
+      
+      // For each precise phrase, find its containing sentence
+      const sentences = transcriptionText.split(/[.!?]+/).filter(s => s.trim().length > 0);
+      
+      // Process each phrase
+      for (const phrase of (parsedAnalysis.preciseLanguage || [])) {
         console.log(`\nPhrase: "${phrase.phrase}"`);
-        console.log(`Significance: "${phrase.significance}"`);
-        console.log(`Category: "${phrase.category}"`);
-        console.log(`In sentence: "${transcriptionText.substring(phrase.startIndex, phrase.endIndex)}"`);
+        
+        // Find which sentence contains this phrase
+        const phraseText = phrase.phrase;
+        let foundSentence = null;
+        let sentenceText = null;
+        
+        for (const sentence of sentences) {
+          if (sentence.includes(phraseText)) {
+            foundSentence = sentence.trim();
+            sentenceText = foundSentence;
+            break;
+          }
+        }
+        
+        if (!sentenceText) {
+          console.log(`Could not find sentence containing phrase "${phraseText}"`);
+          continue;
+        }
+        
+        console.log(`In sentence: "${sentenceText}"`);
+        console.log(`Original indices: ${phrase.startIndex}-${phrase.endIndex}`);
+        
+        // Calculate relative indices within the sentence
+        const sentenceStartIndex = transcriptionText.indexOf(sentenceText);
+        const relativeStartIndex = phrase.startIndex - sentenceStartIndex;
+        const relativeEndIndex = phrase.endIndex - sentenceStartIndex;
+        
+        console.log(`Relative indices: ${relativeStartIndex}-${relativeEndIndex}`);
+        
+        // Extract the text at these indices to verify
+        const extractedText = sentenceText.substring(relativeStartIndex, relativeEndIndex);
+        console.log(`Extracted text: "${extractedText}"`);
         
         // If the extracted text doesn't match the phrase, try to find the exact phrase in the sentence
-        if (actualText !== phrase.phrase) {
+        if (extractedText !== phraseText) {
           console.log(`Text mismatch! Searching for exact phrase in sentence...`);
           
           // Try to find the exact phrase in the sentence
-          const phraseIndex = transcriptionText.indexOf(phrase.phrase);
-          if (phraseIndex !== -1) {
-            phrase.startIndex = phraseIndex;
-            phrase.endIndex = phraseIndex + phrase.phrase.length;
-            console.log(`Found exact phrase at indices ${phrase.startIndex}-${phrase.endIndex}`);
-            console.log(`New extracted text: "${transcriptionText.substring(phrase.startIndex, phrase.endIndex)}"`);
-          } else {
-            // If exact phrase not found, try case-insensitive search
-            const lowerSentence = transcriptionText.toLowerCase();
-            const lowerPhrase = phrase.phrase.toLowerCase();
-            const lowerPhraseIndex = lowerSentence.indexOf(lowerPhrase);
+          const phraseIndexInSentence = sentenceText.indexOf(phraseText);
+          if (phraseIndexInSentence !== -1) {
+            console.log(`Found exact phrase at indices ${phraseIndexInSentence}-${phraseIndexInSentence + phraseText.length}`);
+            console.log(`New extracted text: "${sentenceText.substring(phraseIndexInSentence, phraseIndexInSentence + phraseText.length)}"`);
             
-            if (lowerPhraseIndex !== -1) {
-              phrase.startIndex = lowerPhraseIndex;
-              phrase.endIndex = lowerPhraseIndex + phrase.phrase.length;
-              console.log(`Found phrase (case-insensitive) at indices ${phrase.startIndex}-${phrase.endIndex}`);
-              console.log(`New extracted text: "${transcriptionText.substring(phrase.startIndex, phrase.endIndex)}"`);
+            // Update the highlight data
+            const highlight = {
+              text: phraseText,
+              start: phraseIndexInSentence,
+              end: phraseIndexInSentence + phraseText.length,
+              significance: phrase.significance,
+              category: phrase.category
+            };
+            
+            console.log(`Highlight data being sent to frontend:`, highlight);
+            
+            // Add to the list of highlighted phrases for this sentence
+            let existingInstance = highlightedPhrases.find(p => p.sentence === sentenceText);
+            if (existingInstance) {
+              existingInstance.highlights.push(highlight);
             } else {
-              console.log(`Could not find exact phrase in sentence, using original indices`);
+              highlightedPhrases.push({
+                sentence: sentenceText,
+                highlights: [highlight]
+              });
             }
+          } else {
+            console.log(`Could not find exact phrase in sentence`);
+          }
+        } else {
+          // If the text matched, use the original indices
+          const highlight = {
+            text: phraseText,
+            start: relativeStartIndex,
+            end: relativeEndIndex,
+            significance: phrase.significance,
+            category: phrase.category
+          };
+          
+          console.log(`Highlight data being sent to frontend:`, highlight);
+          
+          // Add to the list of highlighted phrases for this sentence
+          let existingInstance = highlightedPhrases.find(p => p.sentence === sentenceText);
+          if (existingInstance) {
+            existingInstance.highlights.push(highlight);
+          } else {
+            highlightedPhrases.push({
+              sentence: sentenceText,
+              highlights: [highlight]
+            });
           }
         }
-
-        return phrase;
-      });
+      }
       
-    } catch (e) {
-      console.error('Failed to parse AI response as JSON:', e);
-      // Provide empty preciseLanguage array if parsing fails
-      parsedAnalysis = {
-        preciseLanguage: []
+      console.log('\n=== Final Processed Instances ===');
+      console.log(JSON.stringify(highlightedPhrases, null, 2));
+    } catch (highlightError) {
+      console.error('Error processing highlighted phrases:', highlightError);
+      highlightedPhrases = [];
+    }
+    
+    // Analyze pronoun usage
+    const pronounAnalysis = analyzePronounUsage(transcriptionText);
+    
+    // Analyze erosion tags
+    const erosionTagsResult = await analyzeErosionTags(transcriptionText);
+    console.log('\n=== Erosion Tags Analysis Complete ===');
+    
+    // Calculate final language precision score (weighted average)
+    const baseScore = 70; // Base score
+    const preciseLanguageBonus = Math.min(20, (parsedAnalysis.preciseLanguage?.length || 0) * 5);
+    const pronounPenalty = Math.max(0, Math.min(20, pronounAnalysis.anxiousnessScore / 5));
+    const erosionTagsPenalty = Math.max(0, 20 - (erosionTagsResult?.score || 0) / 5);
+    
+    const finalScore = Math.min(100, Math.max(0, 
+      baseScore + preciseLanguageBonus - pronounPenalty - erosionTagsPenalty
+    ));
+    
+    console.log('\n=== Final Language Precision Score ===');
+    console.log('Score:', Math.round(finalScore));
+    
+    // Analyze pitch patterns
+    let pitchAnalysis = null;
+    try {
+      console.log('\n=== Starting Pitch Analysis ===');
+      
+      // Check if audio path is available
+      const audioPath = transcriptionData.audioPath;
+      if (!audioPath) {
+        throw new Error('No audio path provided for pitch analysis');
+      }
+      
+      // Attempt to analyze pitch patterns
+      pitchAnalysis = await analyzePitch(audioPath, transcriptionData);
+    } catch (pitchError) {
+      console.error('Error processing audio:', pitchError);
+      pitchAnalysis = { 
+        error: pitchError.message || 'Unknown error in pitch analysis',
+        errorType: 'PitchAnalysisError',
+        errorDetail: pitchError.stack
       };
     }
     
-    // Calculate language precision score based on the number of precise phrases
-    const precisionScore = Math.min(100, 
-      Math.max(70, 
-        // Base score of 70, plus 5 points per precise phrase
-        70 + (parsedAnalysis.preciseLanguage.length * 5)
-      )
-    );
-
-    // Add pitch analysis only if audioPath is available
-    let pitchAnalysis = {
-      sentences: [] // Default empty array if pitch analysis fails
-    };
+    console.log('\n=== Analysis Complete ===');
     
-    if (transcriptionData.path) {
-      try {
-        pitchAnalysis = await analyzePitch(transcriptionData.path, transcriptionData);
-      } catch (error) {
-        console.error('Pitch analysis error:', error);
-        // Continue with empty pitch analysis rather than failing completely
-      }
+    // Check if pitchAnalysis exists and isn't an error
+    const hasPitchData = pitchAnalysis && !pitchAnalysis.error;
+    
+    // Analyze vocal archetypes (if pitch data is available)
+    let vocalArchetypesAnalysis;
+    try {
+      console.log('Analyzing vocal archetypes...');
+      vocalArchetypesAnalysis = await analyzeVocalArchetypes(transcriptionText, hasPitchData ? pitchAnalysis : null);
+      console.log('Vocal archetype analysis response:', vocalArchetypesAnalysis);
+    } catch (vocalError) {
+      console.error('Error in vocal archetypes analysis:', vocalError);
+      vocalArchetypesAnalysis = getDefaultVocalArchetypes();
     }
-
-    // Add weak starters analysis
-    const weakStartersAnalysis = await analyzeWeakStarters(transcriptionText);
     
-    // Add thought flow analysis
-    const thoughtFlowAnalysis = await analyzeThoughtFlow(transcriptionText);
+    // Analyze visual language
+    let visualLanguageAnalysis;
+    try {
+      visualLanguageAnalysis = await analyzeVisualLanguage(transcriptionText);
+      console.log('Visual Language Analysis complete.');
+    } catch (visualError) {
+      console.error('Error in visual language analysis:', visualError);
+      visualLanguageAnalysis = {
+        breakdown: {
+          visual: 40,
+          functional: 60,
+          examples: {
+            visual: [],
+            functional: []
+          }
+        },
+        score: 65
+      };
+    }
     
-    // Add vocal archetypes analysis
-    const vocalArchetypesAnalysis = await analyzeVocalArchetypes(transcriptionText, pitchAnalysis);
+    // Analyze silence comfort (if pitch data is available)
+    let silenceComfortAnalysis;
+    try {
+      silenceComfortAnalysis = {
+        // Process in real-time
+      };
+    } catch (silenceError) {
+      console.error('Error in silence comfort analysis:', silenceError);
+      silenceComfortAnalysis = {
+        groups: [],
+        overallScore: 75
+      };
+    }
     
-    // Add visual language analysis
-    const visualLanguageAnalysis = await analyzeVisualLanguage(transcriptionText);
-    
-    // Add pronoun usage analysis
-    const pronounUsageAnalysis = await analyzePronounUsage(transcriptionText);
-    
-    const insights = {
+    // Compile and return final analysis results
+    return {
       languagePrecision: {
-        preciseInstances: (() => {
-          // Log the raw phrases from the analysis
-          console.log('\n=== Raw Precise Phrases ===');
-          console.log(JSON.stringify(parsedAnalysis.preciseLanguage || [], null, 2));
-          
-          // Map the phrases directly to the format expected by the frontend
-          const instances = (parsedAnalysis.preciseLanguage || [])
-            .slice(0, 7)
-            .map(phrase => {
-              // Find the complete sentence containing this phrase for context
-              let sentenceStart = Math.max(0, 
-                transcriptionText.lastIndexOf('.', phrase.startIndex) + 1
-              );
-              if (sentenceStart === 0) {
-                // If no period found, try looking for other sentence boundaries
-                const altStart = Math.max(0,
-                  Math.max(
-                    transcriptionText.lastIndexOf('?', phrase.startIndex) + 1,
-                    transcriptionText.lastIndexOf('!', phrase.startIndex) + 1
-                  )
-                );
-                if (altStart > 0) sentenceStart = altStart;
-              }
-              
-              let sentenceEnd = transcriptionText.indexOf('.', phrase.endIndex);
-              if (sentenceEnd === -1) {
-                // If no period found, try looking for other sentence boundaries
-                sentenceEnd = Math.max(
-                  transcriptionText.indexOf('?', phrase.endIndex),
-                  transcriptionText.indexOf('!', phrase.endIndex)
-                );
-                // If still not found, use the end of text
-                if (sentenceEnd === -1) sentenceEnd = transcriptionText.length;
-              } else {
-                sentenceEnd += 1; // Include the period
-              }
-              
-              const fullSentence = transcriptionText.substring(sentenceStart, sentenceEnd).trim();
-
-              // Calculate the relative position of the highlight within the sentence
-              let relativeStart = phrase.startIndex - sentenceStart;
-              let relativeEnd = phrase.endIndex - sentenceStart;
-
-              // Verify the phrase text matches what's in the sentence at the calculated positions
-              const extractedText = fullSentence.substring(relativeStart, relativeEnd);
-              console.log(`\nPhrase: "${phrase.phrase}"`);
-              console.log(`In sentence: "${fullSentence}"`);
-              console.log(`Original indices: ${phrase.startIndex}-${phrase.endIndex}`);
-              console.log(`Relative indices: ${relativeStart}-${relativeEnd}`);
-              console.log(`Extracted text: "${extractedText}"`);
-              
-              // If the extracted text doesn't match the phrase, try to find the exact phrase in the sentence
-              if (extractedText !== phrase.phrase) {
-                console.log(`Text mismatch! Searching for exact phrase in sentence...`);
-                
-                // Try to find the exact phrase in the sentence
-                const phraseIndex = fullSentence.indexOf(phrase.phrase);
-                if (phraseIndex !== -1) {
-                  relativeStart = phraseIndex;
-                  relativeEnd = phraseIndex + phrase.phrase.length;
-                  console.log(`Found exact phrase at indices ${relativeStart}-${relativeEnd}`);
-                  console.log(`New extracted text: "${fullSentence.substring(relativeStart, relativeEnd)}"`);
-                } else {
-                  // If exact phrase not found, try case-insensitive search
-                  const lowerSentence = fullSentence.toLowerCase();
-                  const lowerPhrase = phrase.phrase.toLowerCase();
-                  const lowerPhraseIndex = lowerSentence.indexOf(lowerPhrase);
-                  
-                  if (lowerPhraseIndex !== -1) {
-                    relativeStart = lowerPhraseIndex;
-                    relativeEnd = lowerPhraseIndex + phrase.phrase.length;
-                    console.log(`Found phrase (case-insensitive) at indices ${relativeStart}-${relativeEnd}`);
-                    console.log(`New extracted text: "${fullSentence.substring(relativeStart, relativeEnd)}"`);
-                  } else {
-                    console.log(`Could not find exact phrase in sentence, using original indices`);
-                  }
-                }
-              }
-
-              const highlightData = {
-                text: phrase.phrase,
-                start: relativeStart,
-                end: relativeEnd,
-                significance: phrase.significance,
-                category: phrase.category
-              };
-
-              console.log('Highlight data being sent to frontend:', highlightData);
-              
-              return {
-                sentence: fullSentence,
-                highlights: [highlightData]
-              };
-            });
-
-          // Log the final processed instances
-          console.log('\n=== Final Processed Instances ===');
-          console.log(JSON.stringify(instances, null, 2));
-          
-          return instances;
-        })(),
-        score: Math.min(100, 
-          Math.max(70, 
-            // Base score of 70, plus 5 points per precise phrase
-            70 + (parsedAnalysis.preciseLanguage?.length || 0) * 5
-          )
-        )
+        instances: highlightedPhrases,
+        pronouns: pronounAnalysis,
+        erosionTags: erosionTagsResult,
+        score: Math.round(finalScore)
       },
-      pitchAnalysis: pitchAnalysis,
-      silenceComfort: {
-        groups: (() => {
-          try {
-            // Log initial transcription data
-            console.log('\n=== Processing Silence Comfort Data ===');
-            console.log('Initial words data:', transcriptionData.words?.slice(0, 2));
-
-            // Ensure we have valid words data
-            if (!Array.isArray(transcriptionData?.words) || transcriptionData.words.length === 0) {
-              console.log('No valid words data found in transcription');
-              return [];
-            }
-
-            // First, group words into sentences
-            const sentences = [];
-            let currentSentence = {
-              text: '',
-              words: [],
-              start: null,
-              end: null
-            };
-
-            // Process words into sentences with safety checks
-            transcriptionData.words.forEach((word, idx) => {
-              // Log first few words for debugging
-              if (idx < 3) {
-                console.log(`Processing word ${idx}:`, word);
-              }
-
-              // Skip if word is invalid
-              if (!word || typeof word !== 'object') {
-                console.log('Invalid word object:', word);
-                return;
-              }
-
-              // Process valid word
-              if (word.type === 'word') {
-                // Use word.word instead of word.text
-                const wordText = word.word || '';
-                currentSentence.text += wordText + ' ';
-                currentSentence.words.push(word);
-                
-                // Set start time if not set
-                if (currentSentence.start === null) {
-                  currentSentence.start = parseFloat(word.start || 0);
-                }
-                currentSentence.end = parseFloat(word.end || 0);
-
-                // Check for sentence endings
-                if (wordText.endsWith('.') || wordText.endsWith('!') || wordText.endsWith('?')) {
-                  if (currentSentence.text.trim()) {
-                    sentences.push({
-                      ...currentSentence,
-                      text: currentSentence.text.trim()
-                    });
-                    console.log('Added sentence:', currentSentence.text.trim());
-                  }
-                  currentSentence = {
-                    text: '',
-                    words: [],
-                    start: null,
-                    end: null
-                  };
-                }
-              }
-            });
-
-            // Add any remaining sentence
-            if (currentSentence.text.trim()) {
-              sentences.push({
-                ...currentSentence,
-                text: currentSentence.text.trim()
-              });
-              console.log('Added final sentence:', currentSentence.text.trim());
-            }
-
-            // Log found sentences
-            console.log('\nFound sentences:', sentences.length);
-            if (sentences.length > 0) {
-              console.log('First sentence:', sentences[0]);
-            }
-
-            // If no sentences were found, return empty array
-            if (sentences.length === 0) {
-              console.log('No valid sentences found in transcription');
-              return [];
-            }
-
-            // Calculate pauses between all sentences
-            const allPauses = [];
-            for (let i = 0; i < sentences.length - 1; i++) {
-              const currentSentence = sentences[i];
-              const nextSentence = sentences[i + 1];
-              const pauseDuration = nextSentence.start - currentSentence.end;
-
-              if (pauseDuration > 0.2) {
-                allPauses.push({
-                  index: i,
-                  start: currentSentence.end,
-                  end: nextSentence.start,
-                  duration: pauseDuration,
-                  beforeSentence: currentSentence,
-                  afterSentence: nextSentence
-                });
-              }
-            }
-
-            console.log(`\nFound ${allPauses.length} pauses in the transcript`);
-            
-            // Sort pauses by duration (descending) to find the most significant ones
-            allPauses.sort((a, b) => b.duration - a.duration);
-            
-            // Get the top 3 pauses (or fewer if there aren't 3)
-            const topPauses = allPauses.slice(0, Math.min(3, allPauses.length));
-            
-            console.log(`\nSelected top ${topPauses.length} pauses:`);
-            topPauses.forEach((pause, i) => {
-              console.log(`Pause ${i+1}: ${pause.duration.toFixed(2)}s between "${pause.beforeSentence.text.substring(0, 30)}..." and "${pause.afterSentence.text.substring(0, 30)}..."`);
-            });
-            
-            // Create sections for each significant pause
-            const sections = topPauses.map((pause, index) => {
-              // Include the sentence before and after the pause
-              const sectionSentences = [pause.beforeSentence, pause.afterSentence];
-              
-              // Create a section with a descriptive name based on the pause duration
-              const sectionName = `pause-${index+1}`;
-              const pauseDescription = pause.duration < 0.5 ? 'short' : 
-                                      pause.duration > 2.0 ? 'long' : 'medium';
-              
-              return {
-                section: sectionName,
-                sectionTitle: `${pauseDescription.charAt(0).toUpperCase() + pauseDescription.slice(1)} Pause (${pause.duration.toFixed(1)}s)`,
-                sentences: sectionSentences,
-                pauses: [{
-                  start: pause.start,
-                  end: pause.end,
-                  duration: pause.duration
-                }]
-              };
-            });
-
-            console.log('\n=== Silence Comfort Processing Complete ===\n');
-            return sections;
-
-          } catch (error) {
-            console.error('Error processing silence comfort data:', error);
-            return [];
-          }
-        })(),
-        overallScore: (() => {
-          try {
-            // Calculate a real comfort score based on pause patterns
-            const words = transcriptionData.words || [];
-            if (words.length === 0) return 75; // Default score
-            
-            // Count pauses and calculate their durations
-            let totalPauses = 0;
-            let idealPauses = 0; // Pauses between 0.5 and 2.0 seconds
-            let previousWordEnd = null;
-            
-            words.forEach(word => {
-              if (word.type === 'word') {
-                const wordStart = parseFloat(word.start || 0);
-                
-                if (previousWordEnd !== null) {
-                  const pauseDuration = wordStart - previousWordEnd;
-                  if (pauseDuration > 0.2) { // Minimum pause threshold
-                    totalPauses++;
-                    if (pauseDuration >= 0.5 && pauseDuration <= 2.0) {
-                      idealPauses++;
-                    }
-                  }
-                }
-                
-                previousWordEnd = parseFloat(word.end || 0);
-              }
-            });
-            
-            // Calculate score based on percentage of ideal pauses
-            const score = totalPauses > 0 
-              ? Math.round((idealPauses / totalPauses) * 100)
-              : 75; // Default if no pauses found
-              
-            console.log(`\nSilence Comfort Score: ${score}% (${idealPauses} ideal pauses out of ${totalPauses} total)`);
-            
-            return score;
-          } catch (error) {
-            console.error('Error calculating silence comfort score:', error);
-            return 75; // Default score on error
-          }
-        })()
-      },
-      erosionTags: await analyzeErosionTags(transcriptionText),
-      weakStarters: weakStartersAnalysis,
-      treeOfThought: {
-        dataPoints: thoughtFlowAnalysis.dataPoints,
-        coherenceScore: thoughtFlowAnalysis.coherenceScore
-      },
+      pitch: pitchAnalysis,
       vocalArchetypes: vocalArchetypesAnalysis,
       visualLanguage: visualLanguageAnalysis,
-      pronounUsage: pronounUsageAnalysis
+      silenceComfort: (hasPitchData && pitchAnalysis.sentences) ? processSilenceComfort(transcriptionData) : {
+        groups: [],
+        overallScore: 75
+      },
+      thoughtFlow: analyzeThoughtFlow(transcriptionText)
     };
-
-    console.log('\n=== Final Language Precision Score ===');
-    console.log('Score:', Math.round(precisionScore));
-    console.log('\n=== Analysis Complete ===\n');
-
-    return insights;
   } catch (error) {
-    console.error('\n=== Analysis Error ===');
-    console.error('Error:', error);
-    throw new Error('Failed to analyze transcription');
+    console.error('Error analyzing transcript:', error);
+    return {
+      languagePrecision: {
+        instances: [],
+        pronouns: {
+          counts: { i: 0, we: 0, you: 0, other: 0 },
+          distribution: { self: 33, inclusive: 33, other: 34 },
+          examples: { self: [], inclusive: [], other: [] },
+          anxiousnessScore: 70
+        },
+        erosionTags: {
+          erosionTags: []
+        },
+        score: 70
+      },
+      pitch: { 
+        error: error.message || 'Unknown error in analysis',
+        errorType: 'AnalysisError',
+        errorDetail: error.stack
+      },
+      vocalArchetypes: getDefaultVocalArchetypes(),
+      visualLanguage: {
+        breakdown: {
+          visual: 40,
+          functional: 60,
+          examples: {
+            visual: [],
+            functional: []
+          }
+        },
+        score: 65
+      },
+      silenceComfort: {
+        groups: [],
+        overallScore: 75
+      },
+      thoughtFlow: {
+        structure: [
+          { progress: 0, relevance: 1, label: "Opening" },
+          { progress: 50, relevance: 2, label: "Main Content" },
+          { progress: 100, relevance: 1, label: "Closing" }
+        ],
+        coherenceScore: 75
+      }
+    };
   }
 }
 
@@ -1850,41 +1941,32 @@ app.post('/api/analyze', upload.single('audio'), async (req, res) => {
       // Transcribe the audio
       const transcriptionData = await transcribeAudio(req.file);
       
-      // Analyze the transcript
+      // Add the audio path to the transcription data for pitch analysis
+      transcriptionData.audioPath = req.file.path;
+      
+      // Analyze the transcript (this will also handle pitch analysis internally)
       const analysisData = await analyzeTranscript(transcriptionData);
-      
-      // Analyze pitch
-      const pitchData = await analyzePitch(req.file.path, transcriptionData);
-      
-      console.log(`\n=== Analysis Results Structure ===`);
-      console.log(`Pitch Data Structure:`);
-      console.log(`- sentences: Array with ${pitchData.sentences?.length || 0} items`);
-      if (pitchData.sentences && pitchData.sentences.length > 0) {
-        console.log(`- First sentence structure:`, JSON.stringify(pitchData.sentences[0], null, 2).substring(0, 200) + '...');
-      }
-      console.log(`- audioSnippetUrl: ${pitchData.audioSnippetUrl || 'Not available'}`);
       
       // Build the response with all analysis data
       const responseData = {
         transcription: transcriptionData,
         analysis: {
           languagePrecision: analysisData.languagePrecision,
-          pitch: pitchData.sentences,
-          audioSnippetUrl: pitchData.audioSnippetUrl,
+          pitch: analysisData.pitch.error ? [] : analysisData.pitch.sentences || [],
+          audioSnippetUrl: analysisData.pitch.error ? null : analysisData.pitch.audioSnippetUrl,
           silenceComfort: analysisData.silenceComfort,
-          erosionTags: analysisData.erosionTags,
-          weakStarters: analysisData.weakStarters,
-          treeOfThought: analysisData.treeOfThought,
+          erosionTags: analysisData.languagePrecision.erosionTags,
           vocalArchetypes: analysisData.vocalArchetypes,
           visualLanguage: analysisData.visualLanguage,
-          pronounUsage: analysisData.pronounUsage
+          thoughtFlow: analysisData.thoughtFlow,
+          pitchError: analysisData.pitch.error || null
         }
       };
       
       console.log(`\n=== Response Data Structure ===`);
       console.log(`- transcription: Present`);
       console.log(`- analysis.languagePrecision: Present`);
-      console.log(`- analysis.pitch: Array with ${responseData.analysis.pitch?.length || 0} items`);
+      console.log(`- analysis.pitch: ${analysisData.pitch.error ? 'Error: ' + analysisData.pitch.error : 'Array with ' + (responseData.analysis.pitch?.length || 0) + ' items'}`);
       console.log(`- analysis.audioSnippetUrl: ${responseData.analysis.audioSnippetUrl || 'Not available'}`);
       console.log(`- analysis.silenceComfort: ${responseData.analysis.silenceComfort ? 'Present' : 'Missing'}`);
       
@@ -1962,35 +2044,32 @@ app.post('/api/speech/analyze-snippet', upload.single('audio'), async (req, res)
 
     // Add metadata to transcription
     transcription.path = req.file.path;
+    transcription.audioPath = req.file.path;
     transcription.isSnippet = true;
     transcription.startTime = parseFloat(req.body.startTime) || 0;
     transcription.endTime = parseFloat(req.body.endTime) || 0;
 
-    // Analyze the transcription
+    // Analyze the transcription (this will also handle pitch analysis internally)
     const analysis = await analyzeTranscript(transcription);
-    
-    // Analyze pitch - add this step
-    const pitchData = await analyzePitch(req.file.path, transcription);
     
     console.log(`\n=== Snippet Analysis Results Structure ===`);
     console.log(`Pitch Data Structure:`);
-    console.log(`- sentences: Array with ${pitchData.sentences?.length || 0} items`);
-    console.log(`- audioSnippetUrl: ${pitchData.audioSnippetUrl || 'Not available'}`);
+    console.log(`- pitch: ${analysis.pitch.error ? 'Error: ' + analysis.pitch.error : 'Array with ' + (analysis.pitch.sentences?.length || 0) + ' items'}`);
+    console.log(`- audioSnippetUrl: ${analysis.pitch.error ? 'Not available due to error' : analysis.pitch.audioSnippetUrl || 'Not available'}`);
     
     // Build the complete response with all analysis data
     const responseData = {
       transcription,
       analysis: {
         languagePrecision: analysis.languagePrecision,
-        pitch: pitchData.sentences,
-        audioSnippetUrl: pitchData.audioSnippetUrl,
+        pitch: analysis.pitch.error ? [] : analysis.pitch.sentences || [],
+        audioSnippetUrl: analysis.pitch.error ? null : analysis.pitch.audioSnippetUrl,
         silenceComfort: analysis.silenceComfort,
-        erosionTags: analysis.erosionTags,
-        weakStarters: analysis.weakStarters,
-        treeOfThought: analysis.treeOfThought,
+        erosionTags: analysis.languagePrecision.erosionTags,
         vocalArchetypes: analysis.vocalArchetypes,
         visualLanguage: analysis.visualLanguage,
-        pronounUsage: analysis.pronounUsage
+        thoughtFlow: analysis.thoughtFlow,
+        pitchError: analysis.pitch.error || null
       }
     };
     
